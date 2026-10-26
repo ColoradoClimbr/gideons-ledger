@@ -919,12 +919,23 @@ def main():
                 report("Steam is starting. Waiting for it to sign in...", 30 + 30 * min(i / 15, 1))
                 time.sleep(1)
         report("Starting Mod Engine 3 with auto-reveal walls...", 65)
-        try:
-            subprocess.Popen([me3, "launch", "-p", os.path.join(here, "walls.me3")], cwd=here)
-        except Exception as e:
-            log.exception("Launch with walls failed")
-            report(f"Launch failed: {e}", 0)
-            return f"Launch failed: {e}"
+        for attempt in range(1, 6):  # me3 exits within seconds if Steam isn't ready (e.g. mid-update restart); it stays alive while the game runs
+            try:
+                proc = subprocess.Popen([me3, "launch", "-p", os.path.join(here, "walls.me3")], cwd=here)
+            except Exception as e:
+                log.exception("Launch with walls failed")
+                report(f"Launch failed: {e}", 0)
+                return f"Launch failed: {e}"
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                break  # still running: the game started
+            log.warning("Launch with walls: me3 exited with %s (attempt %d), Steam probably not ready", proc.returncode, attempt)
+            report(f"Steam is not ready yet (attempt {attempt}/5). Retrying...", 65)
+            time.sleep(10)
+        else:
+            report("Steam never became ready. Let it finish updating and sign in, then click again.", 0)
+            return "Steam never became ready. Let it finish updating and sign in, then click again."
         log.info("Launch with walls: me3 started")
         await_game(70)
         return "Launching with auto-reveal walls. Stay offline."
