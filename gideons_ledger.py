@@ -1,7 +1,7 @@
 """Gideon's Ledger: Elden Ring trainer. Launch offline, read/add runes, smart drops. Offline only."""
-import logging, queue, re, struct, sys, threading, time, tkinter as tk
+import logging, queue, re, struct, sys, threading, time, tkinter as tk, tkinter.messagebox
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 log = logging.getLogger("ledger")
 log.addHandler(logging.NullHandler())
 
@@ -90,6 +90,34 @@ def add_runes(delta):
     new = new_runes(runes, delta)
     pm.write_int(player + RUNES, new)
     return f"Runes {runes:,} -> {pm.read_int(player + RUNES):,}."
+
+
+# HP / FP: PlayerGameData holds three ints each: HP +0x10 (current, max, base max), FP +0x1C (current, max, base max). Changing a
+# stat in game (level up) makes the game recompute them, which drops the bonus.
+STAT_OFFS, STAT_STEP, STAT_CAP = {"HP": 0x10, "FP": 0x1C}, 500, 9999
+
+
+def plan_stat(cur, mx, base, delta):
+    """(cur, max, base) after moving all three by delta, base clamped to 1..STAT_CAP; None if the values do not look like HP/FP."""
+    if not (1 <= base <= STAT_CAP and 1 <= mx <= STAT_CAP and 0 <= cur <= mx):  # base may exceed max: the game resets max on level up but not base
+        return None
+    d = min(max(mx + delta, 1), STAT_CAP) - mx
+    return (max(cur + d, 1) if cur else 0), mx + d, min(max(base + d, 1), STAT_CAP)  # a living bar never drops to 0 from lowering the max
+
+
+def boost_stat(name, delta):
+    pm, player = attach()[:2]
+    off = STAT_OFFS[name]
+    cur, mx, base = (pm.read_int(player + off + 4 * i) for i in range(3))
+    new = plan_stat(cur, mx, base, delta)
+    if new is None:
+        raise RuntimeError(f"{name} read {cur}/{mx}/{base}: does not look right. Not writing.")
+    if new == (cur, mx, base):
+        return f"{name} is already at the limit ({mx})."
+    for i, v in enumerate(new):
+        pm.write_int(player + off + 4 * i, v)
+    log.info("%s %d -> %d", name, mx, new[1])
+    return f"Max {name} {mx} -> {new[1]}. If it reverts after a level up, click again."
 
 
 # Param tables (layout from TGA param_containers.h). CSRegulationManager+0x18/+0x20 = begin/end of ParamResCap* list.
@@ -452,6 +480,115 @@ def smart_dry_run():
     return f"You own {len(weapons)} weapons, {len(armor)} armor. {n} of {len(rows)} drop lots would change. Nothing written."
 
 
+# Delete duplicate gear from the bag by calling the game's own inventory remove (found by signature, like ItemGive), so the game
+# unregisters the slot itself. The remove takes (EquipGameData, slot, qty delta, 1) + two stack flags (0, 1), copied from how the game
+# consumes a goods item. Bag = list struct S at [player+0x5D0] (== EquipGameData+0x158); slot = S.u32[+0x1C] + list index.
+# Equipped slots hold inventory handles in EquipGameData+0x80..0x200. Chest is not touched.
+REMOVE_AOB = rb"\x48\x8B\xC4\x48\x89\x58\x10\x44\x88\x48\x20\x44\x89\x40\x18\x55\x56\x57\x41\x54\x41\x55\x41\x56"
+EQUIP_GAME_DATA, EQUIP_HANDLES, NO_GEM, UNARMED = 0x2B0, (0x80, 384), 0xFFFFFFFF, 110000
+_dupe_tested = False  # first delete of a session removes just one item so you can check the game before the rest
+
+
+def bag_entries(read, player):
+    """[(game slot, handle, item id, qty, gem)] for the bag; list index i is game slot split + i."""
+    s = _q(read, player + INV_SLOTS[0][0])
+    split = struct.unpack("<I", read(s + 0x1C, 4))[0]
+    raw = read(_q(read, s + 0x40), 0x18 * INV_SLOTS[0][1])
+    out = []
+    for i in range(INV_SLOTS[0][1]):
+        handle, item, qty, _, _, gem = struct.unpack_from("<IIIIII", raw, 0x18 * i)
+        if handle and item != 0xFFFFFFFF:
+            out.append((split + i, handle, item, qty, gem))
+    return out
+
+
+def equipped_handles(read, player):
+    return set(struct.unpack("<96I", read(player + EQUIP_GAME_DATA + EQUIP_HANDLES[0], EQUIP_HANDLES[1]))) - {0}
+
+
+def plan_dupes(entries, equipped):
+    """Extra copies to remove -> [(slot, handle, item)]. Same weapon = same id apart from upgrade level (affinity counts as different).
+    Keeps the equipped copy, else an upgraded one, else the first. Never removes equipped, upgraded, Ash-of-War'd or stacked gear."""
+    groups = {}
+    for e in entries:
+        kind = e[2] >> 28
+        if kind in (0, 1) and e[2] != UNARMED:  # the game keeps one Unarmed entry per empty hand slot
+            groups.setdefault((kind, e[2] - e[2] % 100 if kind == 0 else e[2] & 0x0FFFFFFF), []).append(e)
+    out = []
+    for (kind, _), g in groups.items():
+        if len(g) < 2:
+            continue
+        keep = next((e for e in g if e[1] in equipped), None) or next((e for e in g if kind == 0 and e[2] % 100), None) or g[0]
+        out += [(e[0], e[1], e[2]) for e in g
+                if e is not keep and e[1] not in equipped and e[3] == 1 and (kind == 1 or (e[2] % 100 == 0 and e[4] == NO_GEM))]
+    return out
+
+
+def _item_name(names, item):
+    return names.get(item) or names.get(item - item % 10000) or f"item {item:#x}"
+
+
+def dupes_summary():
+    """Read-only. -> (count, text)."""
+    pm, player = attach()[:2]
+    plan = plan_dupes(bag_entries(pm.read_bytes, player), equipped_handles(pm.read_bytes, player))
+    if not plan:
+        return 0, "No duplicate weapons or armor in your bag."
+    names = {int(i[2]): i[0] for i in load_items()}
+    shown = "\n".join(f"  {_item_name(names, it)}" for _, _, it in plan[:12])
+    return len(plan), f"{len(plan)} duplicate item(s) in your bag:\n{shown}" + ("\n  ..." if len(plan) > 12 else "")
+
+
+def remove_stub(func, equip_data, slot):
+    """x64 thread start routine: func(rcx=equip_data, edx=slot, r8d=-1, r9d=1, [rsp+0x20]=0, [rsp+0x28]=1); returns func's eax."""
+    return (b"\x48\x83\xEC\x38" + b"\xC6\x44\x24\x20\x00" + b"\xC6\x44\x24\x28\x01"
+            + b"\x48\xB9" + struct.pack("<Q", equip_data) + b"\xBA" + struct.pack("<I", slot)
+            + b"\x41\xB8\xFF\xFF\xFF\xFF" + b"\x41\xB9\x01\x00\x00\x00"
+            + b"\x48\xB8" + struct.pack("<Q", func) + b"\xFF\xD0" + b"\x48\x83\xC4\x38\xC3")
+
+
+def delete_dupes():
+    import ctypes
+    import pymem.process
+    global _dupe_tested
+    pm, player = attach()[:2]
+    plan = plan_dupes(bag_entries(pm.read_bytes, player), equipped_handles(pm.read_bytes, player))
+    if not plan:
+        return "No duplicate weapons or armor in your bag."
+    mod = pymem.process.module_from_name(pm.process_handle, "eldenring.exe")
+    base, size = mod.lpBaseOfDll, mod.SizeOfImage
+    func = scan(pm.read_bytes, base, size, aob=REMOVE_AOB)
+    if not func or scan(pm.read_bytes, func + 1, base + size - func - 1, aob=REMOVE_AOB):
+        raise RuntimeError("Inventory remove signature missing or not unique. Game patched? Not calling.")
+    res = backup_save()
+    if not res.startswith("Backed up"):
+        return f"Not deleting: {res}"
+    todo = plan if _dupe_tested else plan[:1]
+    code = pm.allocate(96)
+    gone = 0
+    try:
+        for slot, handle, item in todo:
+            cur = {e[0]: e for e in bag_entries(pm.read_bytes, player)}.get(slot)  # re-read: the list may have changed since the plan
+            if not cur or cur[1] != handle or cur[2] != item:
+                continue
+            stub = remove_stub(func, player + EQUIP_GAME_DATA, slot)
+            pm.write_bytes(code, stub, len(stub))
+            th = pm.start_thread(code)
+            done = ctypes.windll.kernel32.WaitForSingleObject(th, 5000) == 0
+            ctypes.windll.kernel32.CloseHandle(th)
+            if not done:
+                return f"Game did not answer in 5s after {gone} deletion(s). Check the game window."
+            gone += not {e[0] for e in bag_entries(pm.read_bytes, player) if e[1] == handle}
+    finally:
+        pm.free(code)
+    log.info("Deleted %d/%d duplicate(s)", gone, len(todo))
+    if not _dupe_tested:
+        _dupe_tested = gone > 0
+        return (f"Test: deleted {gone} of 1 item. Check your inventory in the game, then click again for the other {len(plan) - gone}."
+                if gone else "Test delete did not remove the item. Nothing else tried.")
+    return f"Deleted {gone} of {len(todo)} duplicate(s). {res}"
+
+
 # Progress: event flags. CSEventFlagMan's VirtualMemoryFlag (VMF) keeps flag bits in blocks of `divisor` (1000) flags,
 # found through a red-black tree keyed by flag_id // divisor. Signature + layout from SoulSplitter's ReadEventFlag
 # (Ghidra-annotated; reimplemented here, not copied). Flag names come from a local data/event_flags.json.
@@ -658,6 +795,48 @@ def set_rune_multiplier(on, mult=2.0):
     return f"Enemy runes OFF (restored {n} enemies)."
 
 
+# No equip weight: zero the float `weight` of every weapon (+0x10), armor (+0x24) and talisman (+0x0C) row (offsets from the Hexinton
+# table), so any gear keeps you light. OFF writes the original 4 bytes back. Takes effect when the game recomputes your load (re-equip).
+WEIGHT_FIELDS = (("EquipParamWeapon", 0x10), ("EquipParamProtector", 0x24), ("EquipParamAccessory", 0x0C))
+_weights = {}  # field addr -> original 4 bytes
+
+
+def plan_weights(read, rows, off):
+    """{field addr: original bytes} for rows with weight > 0. Refuses if the field does not look like weights (floats 0 to 500)."""
+    lo, hi = min(a for _, a in rows) + off, max(a for _, a in rows) + off + 4
+    span = read(lo, hi - lo)
+    raw = {a + off: span[a + off - lo:a + off - lo + 4] for _, a in rows}
+    vals = {f: struct.unpack("<f", b)[0] for f, b in raw.items()}
+    if sum(1 for v in vals.values() if 0 <= v <= 500) < len(vals) * 0.99 or not any(v > 0 for v in vals.values()):
+        raise RuntimeError("Weight field does not look right (offset moved after a patch?). Not writing.")
+    return {f: raw[f] for f, v in vals.items() if v > 0}
+
+
+def set_no_weight(on):
+    pm = attach()[0]
+    if on:
+        if _weights:
+            return "No equip weight already ON."
+        plans = []
+        for name, off in WEIGHT_FIELDS:  # plan everything before writing anything
+            rows = table_rows(pm.read_bytes, param_table(pm.read_bytes, regulation_manager(pm), name))
+            if len(rows) < 100:
+                raise RuntimeError(f"Only {len(rows)} {name} rows found. Not writing.")
+            plans.append(plan_weights(pm.read_bytes, rows, off))
+        for plan in plans:
+            _patch_fields(pm, {a: b"\x00\x00\x00\x00" for a in plan})
+            _weights.update(plan)
+        log.info("No equip weight ON: %d rows", len(_weights))
+        return f"No equip weight ON ({len(_weights)} items). Re-equip your gear or reload the area to see it."
+    if not _weights:
+        return "No equip weight is not ON (or app restarted: restart the game to reset)."
+    n = len(_weights)
+    _patch_fields(pm, dict(_weights))
+    _weights.clear()
+    log.info("No equip weight OFF: %d rows restored", n)
+    return f"Equip weights restored ({n} items)."
+
+
 def load_items():
     """data/items.json: [[name, category, item id incl. category prefix], ...] built by build_items.py from your own cheat table."""
     import os
@@ -808,7 +987,7 @@ def main():
 
     def close():  # put the game's tables back before the app disappears
         busy.acquire(timeout=10)  # let a refresh in progress finish first
-        for fn in (lambda: smart_drops(False), lambda: set_discovery(False), lambda: set_rune_multiplier(False)):
+        for fn in (lambda: smart_drops(False), lambda: set_discovery(False), lambda: set_rune_multiplier(False), lambda: set_no_weight(False)):
             try:
                 fn()
             except Exception:
@@ -1079,6 +1258,31 @@ def main():
     tk.Button(r, text="OFF", command=lambda: run(lambda: set_discovery(False))).pack(side="left", fill="x", expand=True, padx=(4, 0))
     btn(f, "Read discovery", lambda: run(show_discovery), "Shows the current discovery curve values.")
 
+    def dupes_dialog():
+        try:
+            n, text = dupes_summary()
+        except Exception as e:
+            out.set(f"Failed: {e}")
+            return
+        if n and tk.messagebox.askyesno("Delete duplicates", f"{text}\n\nThis permanently deletes them from your bag (your save is backed up first). The first click deletes one test item. Continue?", parent=root):
+            run(delete_dupes)
+        elif not n:
+            out.set(text)
+
+    f = section("HP / FP")
+    for stat in STAT_OFFS:
+        r = line(f, f"Raises or lowers your max {stat} by {STAT_STEP} per click (cap {STAT_CAP}) and your current {stat} with it. The game recomputes it when you level up; click again if it drops.")
+        tk.Label(r, text=f"Max {stat}").pack(side="left")
+        tk.Button(r, text=f"+{STAT_STEP}", command=lambda s=stat: run(lambda: boost_stat(s, STAT_STEP))).pack(side="left", fill="x", expand=True)
+        tk.Button(r, text=f"-{STAT_STEP}", command=lambda s=stat: run(lambda: boost_stat(s, -STAT_STEP))).pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+    f = section("Inventory")
+    r = line(f, "Sets the weight of every weapon, armor piece and talisman to 0, so any gear keeps you light. Re-equip or reload the area after ON. OFF restores the originals; closing the app does this too.")
+    tk.Label(r, text="No equip weight").pack(side="left")
+    tk.Button(r, text="ON", command=lambda: run(lambda: set_no_weight(True))).pack(side="left", fill="x", expand=True)
+    tk.Button(r, text="OFF", command=lambda: run(lambda: set_no_weight(False))).pack(side="left", fill="x", expand=True, padx=(4, 0))
+    btn(f, "Delete duplicate gear...", dupes_dialog, "Deletes extra copies of the same weapon or armor from your bag. Keeps the equipped copy; never touches upgraded, Ash-of-War'd or infused-differently weapons, stacks, or the storage chest. Backs up your save first; the first click deletes just one test item.")
+
     f = section("Read-only")
     btn(f, "Read progress", lambda: run(show_progress), "Story flags, endings, Great Runes, bosses and graces per region. Needs data/event_flags.json (see README).")
     btn(f, "Read NPC quest state", lambda: run(show_quests), "What each NPC would say right now. Needs data/npc_steps.json built from your own game files (see README).")
@@ -1125,6 +1329,35 @@ def selftest():
     s = call_stub(0x1122334455667788, 0xAA, 0xBB, 0xCC)
     assert len(s) == 4 + 10 + 10 + 10 + 3 + 10 + 2 + 5 and s.endswith(b"\xFF\xD0\x48\x83\xC4\x28\xC3")
     assert s[6:14] == struct.pack("<Q", 0xAA) and s[26:34] == struct.pack("<Q", 0xCC)
+    assert plan_stat(2100, 2100, 2100, 500) == (2600, 2600, 2600) and plan_stat(1000, 2100, 2100, 500) == (1500, 2600, 2600)
+    assert plan_stat(2100, 2100, 2100, -500) == (1600, 1600, 1600) and plan_stat(5, 10, 10, -500) == (1, 1, 1)
+    assert plan_stat(9900, 9900, 9900, 500) == (9999, 9999, 9999) and plan_stat(9999, 9999, 9999, 500) == (9999, 9999, 9999)
+    assert plan_stat(2100, 2100, 2600, 500) == (2600, 2600, 3100)  # stale base after level-up revert still works
+    assert plan_stat(0, 0, 0, 500) is None and plan_stat(300, 200, 200, 500) is None  # junk reads are refused
+    wm = bytearray(0x400)  # three rows at 0x100/0x140/0x180, weight float at +0x10: 5.0, 0.0 (weightless), 12.5
+    for a, w in ((0x100, 5.0), (0x140, 0.0), (0x180, 12.5)):
+        struct.pack_into("<f", wm, a + 0x10, w)
+    wrows = [(1, 0x100), (2, 0x140), (3, 0x180)]
+    assert plan_weights(lambda a, n: bytes(wm[a:a + n]), wrows, 0x10) == {0x110: struct.pack("<f", 5.0), 0x190: struct.pack("<f", 12.5)}
+    struct.pack_into("<f", wm, 0x110, 1e9)
+    try:
+        plan_weights(lambda a, n: bytes(wm[a:a + n]), wrows, 0x10); assert False
+    except RuntimeError:
+        pass  # a field full of garbage floats is refused
+    G = lambda slot, h, it, q=1, gem=NO_GEM: (slot, h, it, q, gem)  # bag entry: (slot, handle, item id, qty, gem)
+    assert plan_dupes([G(1, 1, 120000), G(2, 2, 120000)], set()) == [(2, 2, 120000)]  # plain duplicate: keep the first
+    assert plan_dupes([G(1, 1, 120000), G(2, 2, 120000)], {2}) == [(1, 1, 120000)]  # keep the equipped copy
+    assert plan_dupes([G(1, 1, 120000), G(2, 2, 120005)], set()) == [(1, 1, 120000)]  # +5 copy is kept, spare +0 goes
+    assert plan_dupes([G(1, 1, 120005), G(2, 2, 120007)], set()) == []  # both upgraded: neither touched
+    assert plan_dupes([G(1, 1, 120000), G(2, 2, 120100)], set()) == []  # different affinity is not a duplicate
+    assert plan_dupes([G(1, 1, 120000), G(2, 2, 120000, gem=0x1234)], set()) == []  # Ash of War attached: kept
+    assert plan_dupes([G(1, 1, UNARMED), G(2, 2, UNARMED)], set()) == []  # Unarmed slots are the game's own
+    assert plan_dupes([G(1, 1, 50000000, 99), G(2, 2, 50000000, 80)], set()) == []  # stacks (arrows) never removed
+    assert plan_dupes([G(1, 1, 0x1000012C), G(2, 2, 0x1000012C)], set()) == [(2, 2, 0x1000012C)]  # armor duplicate
+    assert plan_dupes([G(1, 1, 0x4000006F), G(2, 2, 0x4000006F)], set()) == []  # goods ignored
+    s = remove_stub(0x1122334455667788, 0xAA, 0x185)
+    assert s[:4] == b"\x48\x83\xEC\x38" and s.endswith(b"\xFF\xD0\x48\x83\xC4\x38\xC3")
+    assert struct.pack("<Q", 0xAA) in s and struct.pack("<I", 0x185) in s
     b = item_block(LORDS_RUNE, 3)
     assert len(b) == 128 and struct.unpack_from("<IIIII", b, 32) == (1, 0x40000B67, 3, 0xFFFFFFFF, 0xFFFFFFFF)
     assert add_lords_rune(0).startswith("Quantity") and add_lords_rune(100).startswith("Quantity")

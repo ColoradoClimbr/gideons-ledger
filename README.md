@@ -23,6 +23,13 @@ Back up your save (`ER0000.sl2`) before using any trainer. Not affiliated with F
 - **Add any item**: search weapons, armor, talismans, spells, goods and ashes of war by name, or type an item ID. Needs an item list
   you build from your own copy of the Hexinton cheat table, see below.
 - **Back up my save**: copies your whole save folder to `save_backups\<timestamp>` next to the app. Old backups are never deleted.
+- **Max HP / FP**: raise or lower max HP and FP by 500 per click (cap 9999); current HP/FP moves with it. The game recomputes
+  them when you level up, so click again if it drops.
+- **No equip weight**: sets the weight of every weapon, armor piece and talisman to 0. Re-equip or reload the area after ON.
+  OFF or closing the app restores the original values.
+- **Delete duplicate gear**: removes extra copies of the same weapon or armor from your bag through the game's own remove
+  function. Keeps the equipped copy and never touches upgraded, Ash-of-War'd or stacked gear, or the storage chest. Backs up
+  your save first; the first click deletes just one test item.
 - **Remembers your settings** (amounts, multipliers, window position) in `ledger_settings.json` next to the app.
 - **Discovery**: multiplies the item-discovery curve (Arcane) by 1 to 100; OFF restores the exact original values.
 - **Smart drops**: every enemy drop lot that offers weapons or armor you don't own always drops them
