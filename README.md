@@ -38,6 +38,8 @@ Back up your save (`ER0000.sl2`) before using any trainer. Not affiliated with F
 - **Read progress**: story flags, endings, Great Runes, boss kills and graces found, per region, read live from
   the game's event flags (read-only). Needs a flag list, see below.
 - **Read NPC quest state** (optional): per NPC, the dialogue they would say right now, decoded from their talk scripts. Needs `data/npc_steps.json`, built from your own game files (not shipped).
+- **NPC quest guide**: [`guide/NPC_Quest_Guide.pdf`](guide/NPC_Quest_Guide.pdf), a printable step-by-step guide to the NPC questlines.
+  `guide/make_guide.py` regenerates it (as `.fodt`, export to PDF with LibreOffice) from `guide/rows.py`.
 - **Launch with auto-reveal walls** (optional): starts the game through [Mod Engine 3](https://github.com/garyttierney/me3)
   with a profile you supply. See below.
 
