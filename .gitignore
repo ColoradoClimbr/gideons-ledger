@@ -25,3 +25,4 @@ game_dir.txt
 ledger.log*
 ledger_settings.json
 save_backups/
+.playwright-mcp/
